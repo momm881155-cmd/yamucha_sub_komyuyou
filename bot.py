@@ -1,4 +1,4 @@
-# bot.py — 1日3回、Gofileリンク3つのみをコミュニティに投稿
+# bot.py — 1日3回、Gofileリンク3つをコミュニティに投稿（通し番号は800からスタートし蓄積）
 import json
 import os
 import re
@@ -33,7 +33,7 @@ def _default_state():
         "last_post_date": None,
         "posts_today": 0,
         "recent_urls_24h": [],
-        "line_seq": 1,
+        "line_seq": 800,  # ★ 初期値を800から開始
     }
 
 def load_state():
@@ -105,7 +105,7 @@ def is_alive_retry(url: str, retries: int = 1, delay_sec: float = 0.5) -> bool:
             time.sleep(delay_sec)
     return False
 
-# ===== ツイート本文（3件固定＋通し番号、Amazonリンク無し） =====
+# ===== 投稿本文生成（3件固定＋通し番号） =====
 def compose_fixed3_text(gofile_urls, start_seq: int, salt_idx: int = 0, add_sig: bool = True):
     invis = INVISIBLES[salt_idx % len(INVISIBLES)]
     lines = []
@@ -160,12 +160,10 @@ def main():
         print("Daily limit reached; skip.")
         return
 
-    # 既知重複
     already_seen = build_seen_set_from_state(state)
-
     client = get_client()
 
-    # 収集（gofilehub 1〜100ページ）
+    # GofileHubから収集（100ページ）
     if time.monotonic() - start_ts > HARD_LIMIT_SEC:
         print("[warn] time budget exceeded before collection; abort.")
         return
@@ -207,7 +205,7 @@ def main():
         return
 
     # 本文生成
-    start_seq = int(state.get("line_seq", 1))
+    start_seq = int(state.get("line_seq", 800))
     salt = (now_jst.hour + now_jst.minute) % len(INVISIBLES)
     status_text, _ = compose_fixed3_text(preflight, start_seq=start_seq, salt_idx=salt, add_sig=True)
 
@@ -229,7 +227,7 @@ def main():
                     state["posted_urls"].append(u)
                 state["recent_urls_24h"].append({"url": u, "ts": now_utc.isoformat()})
             state["posts_today"] = state.get("posts_today", 0) + 1
-            state["line_seq"] = start_seq + 3
+            state["line_seq"] = start_seq + 3  # ★ 蓄積でカウントアップ
             save_state(state)
             print(f"Posted (3 gofiles):", status_text)
             return
