@@ -1,4 +1,4 @@
-# bot.py — 1日3回、Gofileリンク3つのみを投稿（Amazonリンク無し）
+# bot.py — 1日3回、Gofileリンク3つのみをコミュニティに投稿
 import json
 import os
 import re
@@ -134,63 +134,16 @@ def get_client():
     )
     return client
 
-def fetch_recent_urls_via_api(client, max_tweets=100) -> tuple[set, str | None]:
-    seen = set()
-    me = client.get_me(user_auth=True)
-    user = me.data if me and me.data else None
-    if not user:
-        return seen, None
-    user_id = user.id
-    username = getattr(user, "username", None)
-    resp = client.get_users_tweets(
-        id=user_id,
-        max_results=min(max_tweets, 100),
-        tweet_fields=["entities", "text"],
-        exclude=["retweets", "replies"]
-    )
-    if resp and resp.data:
-        for t in resp.data:
-            text = t.text or ""
-            for m in GOFILE_RE.findall(text):
-                seen.add(normalize_url(m))
-            ent = getattr(t, "entities", None)
-            if ent and "urls" in ent and ent["urls"]:
-                for u in ent["urls"]:
-                    for key in ("expanded_url", "unwound_url", "display_url", "url"):
-                        val = u.get(key)
-                        if isinstance(val, str) and "gofile.io/d/" in val:
-                            for mm in GOFILE_RE.findall(val):
-                                seen.add(normalize_url(mm))
-    return seen, username
-
-def fetch_recent_urls_via_web(username: str, scrolls: int = 3, wait_ms: int = 1000) -> set:
-    if not username:
-        return set()
-    url = f"https://x.com/{username}"
-    seen = set()
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/123.0.0.0 Safari/123.0.0.0"),
-            locale="ja-JP"
-        )
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(wait_ms)
-        for _ in range(scrolls):
-            page.mouse.wheel(0, 2200)
-            page.wait_for_timeout(wait_ms)
-        html = page.content()
-        context.close()
-        browser.close()
-    for m in GOFILE_RE.findall(html):
-        seen.add(normalize_url(m))
-    return seen
-
 def post_to_x_v2(client, status_text: str):
-    return client.create_tweet(text=status_text)
+    community_id = os.getenv("X_COMMUNITY_ID", "").strip()
+    share_flag = os.getenv("X_SHARE_WITH_FOLLOWERS", "false").lower() in ("1","true","yes")
+
+    kwargs = {}
+    if community_id:
+        kwargs["community_id"] = community_id
+        kwargs["share_with_followers"] = share_flag
+
+    return client.create_tweet(text=status_text, **kwargs)
 
 # ===== main =====
 def main():
@@ -207,31 +160,18 @@ def main():
         print("Daily limit reached; skip.")
         return
 
-    # 1) state由来の既知重複
+    # 既知重複
     already_seen = build_seen_set_from_state(state)
 
-    # 2) タイムライン既出（API→Web）
     client = get_client()
-    timeline_seen = set()
-    username = None
-    try:
-        timeline_seen, username = fetch_recent_urls_via_api(client, max_tweets=100)
-        print(f"[info] recent timeline gofiles via API: {len(timeline_seen)} (user={username})")
-    except tweepy.Unauthorized:
-        username = os.getenv("X_SCREEN_NAME", username)
-        web_seen = fetch_recent_urls_via_web(username=username, scrolls=3, wait_ms=1000) if username else set()
-        timeline_seen = web_seen
-        print(f"[info] recent timeline gofiles via WEB: {len(timeline_seen)} (user={username})")
-    if timeline_seen:
-        already_seen |= timeline_seen
 
-    # 3) 収集（gofilehub 1〜100ページ）
+    # 収集（gofilehub 1〜100ページ）
     if time.monotonic() - start_ts > HARD_LIMIT_SEC:
         print("[warn] time budget exceeded before collection; abort.")
         return
     candidates = collect_fresh_gofile_urls(
         already_seen=already_seen,
-        want=12,         # 余裕を持って少し多めに拾う
+        want=12,
         num_pages=100
     )
     print(f"[info] collected candidates: {len(candidates)}")
@@ -239,7 +179,7 @@ def main():
         print("Not enough fresh URLs found; skip.")
         return
 
-    # 4) 直前チェックだけで3本を組む
+    # 死活チェックして3件確保
     target = 3
     tested = set()
     preflight = []
@@ -257,46 +197,33 @@ def main():
         return False
 
     for u in candidates:
-        if len(preflight) >= target or (time.monotonic() - start_ts) > HARD_LIMIT_SEC:
+        if len(preflight) >= target:
             break
         add_if_alive(u)
-
-    if len(preflight) < target and (time.monotonic() - start_ts) <= HARD_LIMIT_SEC:
-        extra = collect_fresh_gofile_urls(
-            already_seen=already_seen | set(preflight) | tested,
-            want=20,
-            num_pages=100
-        )
-        print(f"[info] extra collected for preflight: {len(extra)}")
-        for u in extra:
-            if len(preflight) >= target or (time.monotonic() - start_ts) > HARD_LIMIT_SEC:
-                break
-            add_if_alive(u)
 
     if len(preflight) < target:
         print("Final preflight could not assemble 3 URLs; skip.")
         save_state(state)
         return
 
-    # 5) 本文生成（3件固定・Amazonリンク無し）
+    # 本文生成
     start_seq = int(state.get("line_seq", 1))
     salt = (now_jst.hour + now_jst.minute) % len(INVISIBLES)
     status_text, _ = compose_fixed3_text(preflight, start_seq=start_seq, salt_idx=salt, add_sig=True)
 
-    # 280字調整（URL短縮換算）
     if estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.replace(". https://", ".https://")
     while estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.rstrip(ZWSP + ZWNJ)
 
-    # 6) 投稿
+    # 投稿
     for attempt in range(3):
         try:
             resp = post_to_x_v2(client, status_text)
             tweet_id = resp.data.get("id") if resp and resp.data else None
             print(f"[info] tweeted id={tweet_id}")
 
-            # 7) 状態更新（投稿に使ったURLのみ既出扱い）
+            # 状態更新
             for u in preflight[:3]:
                 if u not in state["posted_urls"]:
                     state["posted_urls"].append(u)
@@ -308,25 +235,8 @@ def main():
             return
 
         except tweepy.Forbidden as e:
-            body = ""
-            try:
-                body = e.response.json()
-            except Exception:
-                body = str(e)
-            s = str(body).lower()
-            if "duplicate content" in s:
-                salt = (salt + 1) % len(INVISIBLES)
-                status_text, _ = compose_fixed3_text(preflight, start_seq=start_seq, salt_idx=salt, add_sig=True)
-                if estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
-                    status_text = status_text.replace(". https://", ".https://")
-                while estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
-                    status_text = status_text.rstrip(ZWSP + ZWNJ)
-                print("[warn] duplicate content; retry with new invisible salt.")
-                time.sleep(1.0)
-                continue
-            else:
-                print(f"[error] Forbidden: {e}")
-                raise
+            print(f"[error] Forbidden: {e}")
+            raise
         except Exception as e:
             print(f"[error] create_tweet failed: {e}")
             raise
