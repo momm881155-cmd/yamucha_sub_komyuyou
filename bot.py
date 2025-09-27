@@ -1,4 +1,9 @@
-# bot.py — 1日3回、Gofileリンク3つをコミュニティに投稿（通し番号は800からスタートし蓄積）
+# bot.py — 1日3回、Gofileリンク3つをコミュニティに投稿（通し番号は800から蓄積）
+# ・コミュニティ投稿：非公開挙動として /2/tweets に community_id を含めてOAuth1署名で直POST
+# ・通常投稿      ：community_id 未指定時は Tweepy v2 で通常ポスト
+# ・通し番号は800から開始し、投稿ごとに+3（Amazonリンク無し）
+# ・収集元は gofilehub（1〜100ページ）、死にリンクは除外
+
 import json
 import os
 import re
@@ -6,13 +11,21 @@ import time
 from datetime import datetime, timezone, timedelta
 from dateutil import tz
 import tweepy
+import requests
+
+# requests-oauthlib が未インストールでも分かりやすく失敗させる
+try:
+    from requests_oauthlib import OAuth1
+except ImportError:
+    OAuth1 = None
+
 from playwright.sync_api import sync_playwright
 
 from goxplorer import collect_fresh_gofile_urls, is_gofile_alive
 
 # ===== 設定 =====
 STATE_FILE = "state.json"
-DAILY_LIMIT = 3                 # 1日3投稿
+DAILY_LIMIT = 3                 # 1日3投稿（cronで08/20/22に起動）
 JST = tz.gettz("Asia/Tokyo")
 TWEET_LIMIT = 280
 TCO_URL_LEN = 23
@@ -33,7 +46,7 @@ def _default_state():
         "last_post_date": None,
         "posts_today": 0,
         "recent_urls_24h": [],
-        "line_seq": 800,  # ★ 初期値を800から開始
+        "line_seq": 800,  # ★ 初期値を800から開始（蓄積）
     }
 
 def load_state():
@@ -122,7 +135,7 @@ def compose_fixed3_text(gofile_urls, start_seq: int, salt_idx: int = 0, add_sig:
         text = text + sig
     return text, take
 
-# ===== X API =====
+# ===== X API（通常ポスト用） =====
 def get_client():
     client = tweepy.Client(
         bearer_token=None,
@@ -134,16 +147,43 @@ def get_client():
     )
     return client
 
-def post_to_x_v2(client, status_text: str):
-    community_id = os.getenv("X_COMMUNITY_ID", "").strip()
-    share_flag = os.getenv("X_SHARE_WITH_FOLLOWERS", "false").lower() in ("1","true","yes")
+def post_to_x_api(client, status_text: str):
+    # 通常ポスト（コミュニティ非対応）
+    return client.create_tweet(text=status_text)
 
-    kwargs = {}
-    if community_id:
-        kwargs["community_id"] = community_id
-        kwargs["share_with_followers"] = share_flag
+# ===== コミュニティ投稿（非公開挙動：/2/tweets に community_id を付与して直POST） =====
+def _oauth1_session():
+    if OAuth1 is None:
+        raise RuntimeError("requests-oauthlib が必要です。requirements.txt に 'requests-oauthlib==1.3.1' を追加してください。")
+    return OAuth1(
+        os.environ["X_API_KEY"],
+        os.environ["X_API_SECRET"],
+        os.environ["X_ACCESS_TOKEN"],
+        os.environ["X_ACCESS_TOKEN_SECRET"],
+        signature_type='auth_header'
+    )
 
-    return client.create_tweet(text=status_text, **kwargs)
+def post_to_community_via_undocumented_api(status_text: str, community_id: str):
+    """
+    非公開挙動: /2/tweets に community_id を含めてPOST
+    ※ 将来使えなくなる可能性がある点に注意
+    """
+    url = "https://api.twitter.com/2/tweets"  # 環境によっては https://api.x.com/2/tweets でもOK
+    payload = {
+        "text": status_text,
+        "community_id": str(community_id)
+        # "share_with_followers": False  # 必要なら True（環境依存）
+    }
+    sess = _oauth1_session()
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, data=json.dumps(payload), auth=sess, timeout=30)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    if not r.ok:
+        raise RuntimeError(f"community post failed {r.status_code}: {body}")
+    return body
 
 # ===== main =====
 def main():
@@ -161,9 +201,8 @@ def main():
         return
 
     already_seen = build_seen_set_from_state(state)
-    client = get_client()
 
-    # GofileHubから収集（100ページ）
+    # 収集（gofilehub 1〜100ページ）
     if time.monotonic() - start_ts > HARD_LIMIT_SEC:
         print("[warn] time budget exceeded before collection; abort.")
         return
@@ -204,40 +243,44 @@ def main():
         save_state(state)
         return
 
-    # 本文生成
+    # 本文生成（通し番号は蓄積。800→803…）
     start_seq = int(state.get("line_seq", 800))
     salt = (now_jst.hour + now_jst.minute) % len(INVISIBLES)
     status_text, _ = compose_fixed3_text(preflight, start_seq=start_seq, salt_idx=salt, add_sig=True)
 
+    # 280字制限の安全化（URL換算）
     if estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.replace(". https://", ".https://")
     while estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.rstrip(ZWSP + ZWNJ)
 
-    # 投稿
-    for attempt in range(3):
-        try:
-            resp = post_to_x_v2(client, status_text)
+    # 投稿：community_id があればコミュニティ投稿、無ければ通常API
+    community_id = os.getenv("X_COMMUNITY_ID", "").strip()
+    try:
+        if community_id:
+            resp = post_to_community_via_undocumented_api(status_text, community_id)
+            tweet_id = resp.get("data", {}).get("id") if isinstance(resp, dict) else None
+            print(f"[info] community posted id={tweet_id}")
+        else:
+            client = get_client()
+            resp = post_to_x_api(client, status_text)
             tweet_id = resp.data.get("id") if resp and resp.data else None
             print(f"[info] tweeted id={tweet_id}")
 
-            # 状態更新
-            for u in preflight[:3]:
-                if u not in state["posted_urls"]:
-                    state["posted_urls"].append(u)
-                state["recent_urls_24h"].append({"url": u, "ts": now_utc.isoformat()})
-            state["posts_today"] = state.get("posts_today", 0) + 1
-            state["line_seq"] = start_seq + 3  # ★ 蓄積でカウントアップ
-            save_state(state)
-            print(f"Posted (3 gofiles):", status_text)
-            return
+        # 状態更新（投稿に使ったURLのみ既出扱い）
+        for u in preflight[:3]:
+            if u not in state["posted_urls"]:
+                state["posted_urls"].append(u)
+            state["recent_urls_24h"].append({"url": u, "ts": now_utc.isoformat()})
+        state["posts_today"] = state.get("posts_today", 0) + 1
+        state["line_seq"] = start_seq + 3  # ★ 蓄積でカウントアップ
+        save_state(state)
+        print(f"Posted (3 gofiles):", status_text)
+        return
 
-        except tweepy.Forbidden as e:
-            print(f"[error] Forbidden: {e}")
-            raise
-        except Exception as e:
-            print(f"[error] create_tweet failed: {e}")
-            raise
+    except Exception as e:
+        print(f"[error] post failed: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
