@@ -1,14 +1,15 @@
-name: ThreeTimes Poster
+name: Hourly Poster
 
 on:
   schedule:
-    - cron: "0 23 * * *"  # JST 08:00
-    - cron: "0 11 * * *"  # JST 20:00
-    - cron: "0 13 * * *"  # JST 22:00
+    # JST 08:00, 20:00, 22:00 → UTC 23:00, 11:00, 13:00
+    - cron: "0 23 * * *"
+    - cron: "0 11 * * *"
+    - cron: "0 13 * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: write  # state.json をコミットするため
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -51,6 +52,9 @@ jobs:
           X_SCREEN_NAME: ${{ vars.X_SCREEN_NAME }}
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          # ★ コミュニティ投稿用
+          X_COMMUNITY_ID: ${{ secrets.X_COMMUNITY_ID || vars.X_COMMUNITY_ID }}
+          X_SHARE_WITH_FOLLOWERS: ${{ vars.X_SHARE_WITH_FOLLOWERS }}
         run: |
           python bot.py
 
@@ -60,27 +64,35 @@ jobs:
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
           set -e
+
           if [[ ! -f "state.json" ]]; then
             echo "state.json not found; skip."
             exit 0
           fi
+
           if git diff --quiet -- state.json; then
             echo "state.json unchanged; skip commit."
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           cp state.json /tmp/state.json.saved
           git reset --hard
           git clean -fdx
+
           git fetch origin "${BRANCH_NAME}"
           git checkout "${BRANCH_NAME}"
           git pull --rebase origin "${BRANCH_NAME}" || true
+
           cp /tmp/state.json.saved state.json
+
           if git diff --quiet -- state.json; then
             echo "state.json equal to remote; skip commit."
             exit 0
           fi
+
           git add state.json
           git commit -m "chore: update state $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push origin "${BRANCH_NAME}"
