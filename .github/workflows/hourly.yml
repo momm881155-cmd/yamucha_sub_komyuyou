@@ -2,7 +2,7 @@ name: Hourly Poster
 
 on:
   schedule:
-    # JST 08:00, 20:00, 22:00 → UTC 23:00, 11:00, 13:00
+    # UTCで 23:00, 11:00, 13:00 → JSTで 08:00, 20:00, 22:00 に相当
     - cron: "0 23 * * *"
     - cron: "0 11 * * *"
     - cron: "0 13 * * *"
@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write  # state.json をコミットするため
 
+# ★ 同時実行を禁止して重複投稿を防止
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,6 +25,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ★ 開始時に最新を取り込み（state.jsonの取りこぼし防止）
       - name: Sync with remote
         run: |
           git fetch origin "${BRANCH_NAME}"
@@ -44,20 +46,22 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run bot
+        timeout-minutes: 10   # ← 長時間キャンセル防止の保険
         env:
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           X_SCREEN_NAME: ${{ vars.X_SCREEN_NAME }}
+          X_COMMUNITY_ID: ${{ secrets.X_COMMUNITY_ID }}
+          SCRAPE_TIMEOUT_SEC: 110
+          NUM_PAGES: 100
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-          # ★ コミュニティ投稿用
-          X_COMMUNITY_ID: ${{ secrets.X_COMMUNITY_ID || vars.X_COMMUNITY_ID }}
-          X_SHARE_WITH_FOLLOWERS: ${{ vars.X_SHARE_WITH_FOLLOWERS }}
         run: |
           python bot.py
 
+      # ★ 未追跡のノイズでrebaseが止まらないように「state.jsonだけ退避→クリーン→pull→戻す」で確実にpush
       - name: Commit state
         if: always()
         env:
@@ -70,6 +74,7 @@ jobs:
             exit 0
           fi
 
+          # 変更が無ければ終了
           if git diff --quiet -- state.json; then
             echo "state.json unchanged; skip commit."
             exit 0
@@ -78,16 +83,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # ---- 重要：state.json を退避し、作業ツリーをクリーンに ----
           cp state.json /tmp/state.json.saved
           git reset --hard
           git clean -fdx
 
+          # 最新に追従
           git fetch origin "${BRANCH_NAME}"
           git checkout "${BRANCH_NAME}"
           git pull --rebase origin "${BRANCH_NAME}" || true
 
+          # 退避していた state.json を戻す
           cp /tmp/state.json.saved state.json
 
+          # リモートと差分が無ければコミット不要
           if git diff --quiet -- state.json; then
             echo "state.json equal to remote; skip commit."
             exit 0
