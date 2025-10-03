@@ -1,8 +1,8 @@
 # bot.py — 1日3回、Gofileリンク3つをコミュニティに投稿（通し番号は800から蓄積）
-# ・コミュニティ投稿：非公開挙動として /2/tweets に community_id を含めてOAuth1署名で直POST
-# ・通常投稿      ：community_id 未指定時は Tweepy v2 で通常ポスト
-# ・通し番号は800から開始し、投稿ごとに+3（Amazonリンク無し）
-# ・収集元は gofilehub（1〜100ページ）、死にリンクは除外
+# ・コミュニティ投稿: /2/tweets に community_id を含めて OAuth1 直POST（非公開挙動）
+# ・通常投稿        : community_id 未指定時は Tweepy v2 の通常ポスト
+# ・収集: goxplorer.collect_fresh_gofile_urls() を deadline付きで呼ぶ
+# ・環境変数で締め切り/ページ数を調整: SCRAPE_TIMEOUT_SEC（例:110）, NUM_PAGES（例:100）
 
 import json
 import os
@@ -13,40 +13,31 @@ from dateutil import tz
 import tweepy
 import requests
 
-# requests-oauthlib が未インストールでも分かりやすく失敗させる
 try:
     from requests_oauthlib import OAuth1
 except ImportError:
     OAuth1 = None
 
-from playwright.sync_api import sync_playwright
-
 from goxplorer import collect_fresh_gofile_urls, is_gofile_alive
 
-# ===== 設定 =====
 STATE_FILE = "state.json"
-DAILY_LIMIT = 3                 # 1日3投稿（cronで08/20/22に起動）
+DAILY_LIMIT = 3
 JST = tz.gettz("Asia/Tokyo")
 TWEET_LIMIT = 280
 TCO_URL_LEN = 23
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/[A-Za-z0-9]+", re.I)
-
-# 不可視（重複回避の最小署名）
 ZWSP = "\u200B"
 ZWNJ = "\u200C"
 INVISIBLES = [ZWSP, ZWNJ]
+HARD_LIMIT_SEC = 180  # 3分（保険）
 
-# 実行時間の上限（ウォッチドッグ）
-HARD_LIMIT_SEC = 180  # 3分
-
-# ===== state =====
 def _default_state():
     return {
         "posted_urls": [],
         "last_post_date": None,
         "posts_today": 0,
         "recent_urls_24h": [],
-        "line_seq": 800,  # ★ 初期値を800から開始（蓄積）
+        "line_seq": 800,
     }
 
 def load_state():
@@ -87,7 +78,6 @@ def purge_recent_24h(state, now_utc: datetime):
             buf.append(item)
     state["recent_urls_24h"] = buf
 
-# ===== 正規化＆除外集合 =====
 def normalize_url(u: str) -> str:
     if not u:
         return u
@@ -104,28 +94,25 @@ def build_seen_set_from_state(state) -> set:
         seen.add(normalize_url(item.get("url")))
     return seen
 
-# ===== ユーティリティ =====
 def estimate_tweet_len_tco(text: str) -> int:
     def repl(m): return "U" * TCO_URL_LEN
     replaced = re.sub(r"https?://\S+", repl, text)
     return len(replaced)
 
 def is_alive_retry(url: str, retries: int = 1, delay_sec: float = 0.5) -> bool:
-    for i in range(retries + 1):
+    for _i in range(retries + 1):
         if is_gofile_alive(url):
             return True
-        if i < retries:
-            time.sleep(delay_sec)
+        time.sleep(delay_sec)
     return False
 
-# ===== 投稿本文生成（3件固定＋通し番号） =====
 def compose_fixed3_text(gofile_urls, start_seq: int, salt_idx: int = 0, add_sig: bool = True):
     invis = INVISIBLES[salt_idx % len(INVISIBLES)]
     lines = []
     seq = start_seq
     take = min(3, len(gofile_urls))
     sel = gofile_urls[:take]
-    for i, u in enumerate(sel):
+    for u in sel:
         lines.append(f"{seq}{invis}. {u}")
         seq += 1
     text = "\n".join(lines)
@@ -135,9 +122,8 @@ def compose_fixed3_text(gofile_urls, start_seq: int, salt_idx: int = 0, add_sig:
         text = text + sig
     return text, take
 
-# ===== X API（通常ポスト用） =====
 def get_client():
-    client = tweepy.Client(
+    return tweepy.Client(
         bearer_token=None,
         consumer_key=os.environ["X_API_KEY"],
         consumer_secret=os.environ["X_API_SECRET"],
@@ -145,13 +131,10 @@ def get_client():
         access_token_secret=os.environ["X_ACCESS_TOKEN_SECRET"],
         wait_on_rate_limit=True,
     )
-    return client
 
 def post_to_x_api(client, status_text: str):
-    # 通常ポスト（コミュニティ非対応）
     return client.create_tweet(text=status_text)
 
-# ===== コミュニティ投稿（非公開挙動：/2/tweets に community_id を付与して直POST） =====
 def _oauth1_session():
     if OAuth1 is None:
         raise RuntimeError("requests-oauthlib が必要です。requirements.txt に 'requests-oauthlib==1.3.1' を追加してください。")
@@ -164,16 +147,8 @@ def _oauth1_session():
     )
 
 def post_to_community_via_undocumented_api(status_text: str, community_id: str):
-    """
-    非公開挙動: /2/tweets に community_id を含めてPOST
-    ※ 将来使えなくなる可能性がある点に注意
-    """
-    url = "https://api.twitter.com/2/tweets"  # 環境によっては https://api.x.com/2/tweets でもOK
-    payload = {
-        "text": status_text,
-        "community_id": str(community_id)
-        # "share_with_followers": False  # 必要なら True（環境依存）
-    }
+    url = "https://api.twitter.com/2/tweets"  # 環境によっては https://api.x.com/2/tweets でも可
+    payload = {"text": status_text, "community_id": str(community_id)}
     sess = _oauth1_session()
     headers = {"Content-Type": "application/json"}
     r = requests.post(url, headers=headers, data=json.dumps(payload), auth=sess, timeout=30)
@@ -185,7 +160,6 @@ def post_to_community_via_undocumented_api(status_text: str, community_id: str):
         raise RuntimeError(f"community post failed {r.status_code}: {body}")
     return body
 
-# ===== main =====
 def main():
     start_ts = time.monotonic()
 
@@ -202,21 +176,27 @@ def main():
 
     already_seen = build_seen_set_from_state(state)
 
-    # 収集（gofilehub 1〜100ページ）
+    # 収集の締め切り・ページ数（環境変数で調整可能）
+    scrape_deadline_sec = int(os.getenv("SCRAPE_TIMEOUT_SEC", "110"))  # 例: 110秒
+    num_pages = int(os.getenv("NUM_PAGES", "100"))                      # 例: 100ページ
+
     if time.monotonic() - start_ts > HARD_LIMIT_SEC:
         print("[warn] time budget exceeded before collection; abort.")
         return
+
     candidates = collect_fresh_gofile_urls(
         already_seen=already_seen,
         want=12,
-        num_pages=100
+        num_pages=num_pages,
+        deadline_sec=scrape_deadline_sec,
     )
     print(f"[info] collected candidates: {len(candidates)}")
     if len(candidates) < 3:
         print("Not enough fresh URLs found; skip.")
+        save_state(state)
         return
 
-    # 死活チェックして3件確保
+    # 直前チェックで3件
     target = 3
     tested = set()
     preflight = []
@@ -243,18 +223,16 @@ def main():
         save_state(state)
         return
 
-    # 本文生成（通し番号は蓄積。800→803…）
+    # 本文生成（800→803…）
     start_seq = int(state.get("line_seq", 800))
     salt = (now_jst.hour + now_jst.minute) % len(INVISIBLES)
     status_text, _ = compose_fixed3_text(preflight, start_seq=start_seq, salt_idx=salt, add_sig=True)
 
-    # 280字制限の安全化（URL換算）
     if estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.replace(". https://", ".https://")
     while estimate_tweet_len_tco(status_text) > TWEET_LIMIT:
         status_text = status_text.rstrip(ZWSP + ZWNJ)
 
-    # 投稿：community_id があればコミュニティ投稿、無ければ通常API
     community_id = os.getenv("X_COMMUNITY_ID", "").strip()
     try:
         if community_id:
@@ -267,13 +245,13 @@ def main():
             tweet_id = resp.data.get("id") if resp and resp.data else None
             print(f"[info] tweeted id={tweet_id}")
 
-        # 状態更新（投稿に使ったURLのみ既出扱い）
+        # ★ 投稿成功分だけ保存（ご指定どおり）
         for u in preflight[:3]:
             if u not in state["posted_urls"]:
                 state["posted_urls"].append(u)
             state["recent_urls_24h"].append({"url": u, "ts": now_utc.isoformat()})
         state["posts_today"] = state.get("posts_today", 0) + 1
-        state["line_seq"] = start_seq + 3  # ★ 蓄積でカウントアップ
+        state["line_seq"] = start_seq + 3
         save_state(state)
         print(f"Posted (3 gofiles):", status_text)
         return
