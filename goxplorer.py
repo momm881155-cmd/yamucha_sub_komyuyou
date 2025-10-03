@@ -1,21 +1,14 @@
 # goxplorer.py — gofilelab/newest を巡回し、gofile.io/d/... を収集
 # 優先順:
-# 1) サイトマップ (sitemap_index.xml / sitemap.xml) → 記事URL → 本文から抽出（XMLは正規表現でパース）
+# 1) サイトマップ (sitemap_index.xml / sitemap.xml) → 記事URL → 本文から抽出（XMLは正規表現で<loc>抽出）
 # 2) WP REST API (wp-json/wp/v2/posts) → 本文HTMLから抽出
 # 3) Playwright で /newest?page=N → 記事詳細へ遷移して抽出
 #
-# 改良点（重要）:
-# - 死活判定 is_gofile_alive を高速＆寛容に:
-#   - HEAD(1.5s)→必要時だけ GET(2.5s)
-#   - Cloudflare系(403/503/Just a moment...) は「生存扱い」
-#   - “死亡確定”文言のみ False
-# - collect_fresh_gofile_urls は「3本見つけたら即返す」早期確定
-# - 締め切り deadline_sec 内に収めるため、1件あたりの判定を軽く
-#
-# 共通:
-# - 年齢確認UI（☑ + 「同意して閲覧する」）突破 + localStorage/cookie
-# - redirect/out の中間リンクを 1 回だけ解決
-# - deadline_sec で全体に締め切り
+# ポイント（この版）:
+# - 死活判定は「死亡確定ワードが出たものだけ False」。
+#   403/429/500/503、Cloudflare、タイムアウト等「不明」は True（=投稿可）。
+# - クイック判定: 先頭 60 件だけ高速チェック／want 到達で即返す。
+# - 期限（deadline_sec）を尊重しつつ、抽出ができている状況で“候補0”にならないよう調整。
 
 import os
 import re
@@ -27,7 +20,7 @@ from typing import List, Set, Optional
 import cloudscraper
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 BASE_ORIGIN = "https://gofilelab.com"
 BASE_LIST_URL = BASE_ORIGIN + "/newest?page={page}"
@@ -61,8 +54,6 @@ def _build_scraper():
     if proxies:
         s.proxies.update(proxies)
     s.headers.update(HEADERS)
-
-    # 年齢確認 cookie（サーバ側が参照する場合あり）
     try:
         s.cookies.set("ageVerified", "1", domain="gofilelab.com", path="/")
         s.cookies.set("adult", "true", domain="gofilelab.com", path="/")
@@ -158,8 +149,7 @@ def _extract_locs_from_xml(xml_text: str) -> List[str]:
 
 def _fetch_sitemap_post_urls(scraper, max_pages: int, deadline_ts: Optional[float]) -> List[str]:
     urls: List[str] = []
-
-    def _get(url: str, timeout: int = 10) -> Optional[str]:
+    def _get(url: str, timeout: int = 8) -> Optional[str]:
         try:
             r = scraper.get(url, timeout=timeout)
             r.raise_for_status()
@@ -169,34 +159,26 @@ def _fetch_sitemap_post_urls(scraper, max_pages: int, deadline_ts: Optional[floa
 
     xml = _get(SITEMAP_INDEX) or _get(BASE_ORIGIN + "/sitemap.xml")
     if not xml:
-        print("[warn] sitemap not available")
-        return urls
+        print("[warn] sitemap not available"); return urls
 
     locs = _extract_locs_from_xml(xml)
     if not locs:
-        print("[warn] sitemap had no <loc>")
-        return urls
+        print("[warn] sitemap had no <loc>"); return urls
 
     post_sitemaps = [u for u in locs if "post" in u or "news" in u or "posts" in u] or locs
 
     collected = 0
     for sm in post_sitemaps:
         if _deadline_passed(deadline_ts):
-            print("[info] sitemap deadline reached; stop.")
-            break
+            print("[info] sitemap deadline reached; stop."); break
         xml2 = _get(sm)
-        if not xml2:
-            continue
+        if not xml2: continue
         entry_locs = _extract_locs_from_xml(xml2)
         for u in entry_locs:
-            if not u.startswith(BASE_ORIGIN):
-                continue
-            urls.append(u)
-            collected += 1
-            if collected >= max_pages * 20:
-                break
-        if collected >= max_pages * 20:
-            break
+            if not u.startswith(BASE_ORIGIN): continue
+            urls.append(u); collected += 1
+            if collected >= max_pages * 20: break
+        if collected >= max_pages * 20: break
 
     print(f"[info] sitemap collected {len(urls)} post urls")
     return urls
@@ -204,8 +186,7 @@ def _fetch_sitemap_post_urls(scraper, max_pages: int, deadline_ts: Optional[floa
 def _collect_via_sitemap(num_pages: int, deadline_ts: Optional[float]) -> List[str]:
     s = _build_scraper()
     post_urls = _fetch_sitemap_post_urls(s, max_pages=num_pages, deadline_ts=deadline_ts)
-    if not post_urls:
-        return []
+    if not post_urls: return []
 
     all_urls: List[str] = []
     seen: Set[str] = set()
@@ -213,15 +194,13 @@ def _collect_via_sitemap(num_pages: int, deadline_ts: Optional[float]) -> List[s
 
     for i, post_url in enumerate(post_urls, 1):
         if _deadline_passed(deadline_ts):
-            print(f"[info] sitemap deadline at post {i}; stop.")
-            break
+            print(f("[info] sitemap deadline at post {i}; stop.")); break
         try:
             r = s.get(post_url, timeout=8)
             r.raise_for_status()
             html = r.text
         except Exception as e:
-            print(f"[warn] sitemap detail fetch failed: {post_url} ({e})")
-            continue
+            print(f"[warn] sitemap detail fetch failed: {post_url} ({e})"); continue
         urls = _extract_gofile_from_html(html, s)
         added = 0
         for u in urls:
@@ -241,20 +220,16 @@ def _collect_via_wp_api(num_pages: int, deadline_ts: Optional[float]) -> List[st
 
     for p in range(1, num_pages + 1):
         if _deadline_passed(deadline_ts):
-            print(f"[info] wp-api deadline at page {p}; stop.")
-            break
+            print(f"[info] wp-api deadline at page {p}; stop."); break
         api = WP_POSTS_API.format(page=p)
         try:
             r = s.get(api, timeout=8)
             ctype = r.headers.get("Content-Type", "")
-            if "json" not in ctype:
-                raise ValueError("non-json returned")
+            if "json" not in ctype: raise ValueError("non-json returned")
             arr = r.json()
         except Exception as e:
-            print(f"[warn] wp-api page {p} failed: {e}")
-            break
-        if not isinstance(arr, list) or not arr:
-            break
+            print(f"[warn] wp-api page {p} failed: {e}"); break
+        if not isinstance(arr, list) or not arr: break
 
         added = 0
         for item in arr:
@@ -299,8 +274,7 @@ def _bypass_age_gate(page) -> None:
       localStorage.setItem('age_verified_at', Date.now().toString());
     } catch (e) {}
     """
-    page.evaluate(js)
-    page.wait_for_timeout(120)
+    page.evaluate(js); page.wait_for_timeout(120)
 
     checkbox_selectors = [
         "input[type='checkbox']",
@@ -319,7 +293,6 @@ def _bypass_age_gate(page) -> None:
         "text=Enter",
         "button:has-text('Enter')",
     ]
-
     try:
         for sel in checkbox_selectors:
             cb = page.query_selector(sel)
@@ -327,7 +300,6 @@ def _bypass_age_gate(page) -> None:
                 cb.click(force=True); page.wait_for_timeout(120); break
     except Exception:
         pass
-
     try:
         for sel in button_selectors:
             btn = page.query_selector(sel)
@@ -335,10 +307,8 @@ def _bypass_age_gate(page) -> None:
                 btn.click(force=True); page.wait_for_timeout(200); break
     except Exception:
         pass
-
     try:
-        page.reload(wait_until="domcontentloaded", timeout=18000)
-        page.wait_for_timeout(180)
+        page.reload(wait_until="domcontentloaded", timeout=18000); page.wait_for_timeout(180)
     except Exception:
         pass
 
@@ -359,8 +329,7 @@ def _get_html_pw(url: str, scroll_steps: int = 6, wait_ms: int = 600) -> str:
         page.wait_for_timeout(250); _bypass_age_gate(page)
 
         for _ in range(scroll_steps):
-            page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(wait_ms)
+            page.mouse.wheel(0, 1500); page.wait_for_timeout(wait_ms)
 
         html = page.content()
         context.close()
@@ -368,24 +337,19 @@ def _get_html_pw(url: str, scroll_steps: int = 6, wait_ms: int = 600) -> str:
 
 def _extract_article_links_from_list(html: str) -> List[str]:
     soup = BeautifulSoup(html or "", "html.parser")
-    links: List[str] = []
-    seen = set()
-
+    links: List[str] = []; seen = set()
     for sel in ["article a", ".entry-title a", "a[rel='bookmark']"]:
         for a in soup.select(sel):
-            href = a.get("href")
-            if not href:
-                continue
+            href = a.get("href"); 
+            if not href: continue
             url = urljoin(BASE_ORIGIN, href.strip())
             if url not in seen:
                 seen.add(url); links.append(url)
-
     if len(links) < 8:
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if not href or href.startswith("#"): continue
-            url = urljoin(BASE_ORIGIN, href)
-            pr = urlparse(url)
+            url = urljoin(BASE_ORIGIN, href); pr = urlparse(url)
             if pr.netloc and not pr.netloc.endswith("gofilelab.com"): continue
             bad = ("/newest", "/category/", "/tag/", "/page/", "/search", "/author", "/feed")
             if any(x in pr.path for x in bad): continue
@@ -393,27 +357,19 @@ def _extract_article_links_from_list(html: str) -> List[str]:
             if pr.path.endswith(ext_bad): continue
             if url not in seen:
                 seen.add(url); links.append(url)
-
     return links[:50]
 
 def _collect_via_playwright(num_pages: int, deadline_ts: Optional[float]) -> List[str]:
     s = _build_scraper()
-    all_urls: List[str] = []
-    seen_urls: Set[str] = set()
-    seen_posts: Set[str] = set()
-
+    all_urls: List[str] = []; seen_urls: Set[str] = set(); seen_posts: Set[str] = set()
     for p in range(1, num_pages + 1):
         if _deadline_passed(deadline_ts):
-            print(f"[info] pw deadline at list page {p}; stop.")
-            break
-
+            print(f"[info] pw deadline at list page {p}; stop."); break
         list_url = BASE_LIST_URL.format(page=p)
         try:
             lhtml = _get_html_pw(list_url, scroll_steps=6, wait_ms=600)
         except Exception as e:
-            print(f"[warn] playwright list {p} failed: {e}")
-            lhtml = ""
-
+            print(f"[warn] playwright list {p} failed: {e}"); lhtml = ""
         article_urls = _extract_article_links_from_list(lhtml) if lhtml else []
         print(f"[info] page {p}: found {len(article_urls)} article links")
 
@@ -422,25 +378,20 @@ def _collect_via_playwright(num_pages: int, deadline_ts: Optional[float]) -> Lis
             if _deadline_passed(deadline_ts): break
             if post_url in seen_posts: continue
             seen_posts.add(post_url)
-
             try:
                 dhtml = _get_html_pw(post_url, scroll_steps=3, wait_ms=500)
             except Exception as e:
-                print(f"[warn] playwright detail failed: {post_url} ({e})")
-                dhtml = ""
-
+                print(f"[warn] playwright detail failed: {post_url} ({e})"); dhtml = ""
             urls = _extract_gofile_from_html(dhtml, s) if dhtml else []
             for u in urls:
                 if u not in seen_urls:
                     seen_urls.add(u); all_urls.append(u); added += 1
             time.sleep(0.2)
-
         print(f"[info] page {p}: extracted {added} new urls (total {len(all_urls)})")
         time.sleep(0.3)
     return all_urls
 
-# -------- 死活判定（高速＆寛容） --------
-_CLOUDFLARE_HINTS = ("cloudflare", "just a moment", "attention required")
+# -------- 死活判定（“不明は True”、死亡確定語のみ False） --------
 _DEATH_MARKERS = (
     "This content does not exist",
     "The content you are looking for could not be found",
@@ -449,71 +400,61 @@ _DEATH_MARKERS = (
 )
 
 def is_gofile_alive(url: str) -> bool:
-    """高速・寛容版: 死亡確定ワードのみ False。
-       403/503/Cloudflare 画面は True 扱い（存否は不明だが “死” ではない）。"""
+    """
+    - まず HEAD (timeout=0.8s)。404/410/451 は即 False。
+    - それ以外は GET (timeout=1.5s) で先頭 4KB を見て、死亡確定語があれば False。
+    - 403/429/500/503、Cloudflare、タイムアウト等の“不明”は True（死と断定できないため）。
+    """
     url = fix_scheme(url)
     s = _build_scraper()
-
-    # 1) HEAD で軽く存在チェック
     try:
-        r = s.head(url, timeout=1.5, allow_redirects=True)
-        # 2xx/3xx → OK
-        if 200 <= r.status_code < 400:
-            return True
-        # 403/429/503 → CF等の可能性 → OK扱い
-        if r.status_code in (401, 403, 429, 500, 502, 503):
-            return True
+        r = s.head(url, timeout=0.8, allow_redirects=True)
+        if r.status_code in (404, 410, 451):
+            return False
+        # その他のコードは「不明」扱い（次のGETへ）
     except Exception:
-        # HEAD失敗は即死としない
+        # HEAD 失敗は不明 → 次の GET で判断
         pass
 
-    # 2) GET で死亡確定ワードだけ見る
     try:
-        r = s.get(url, timeout=2.5, allow_redirects=True)
-        text = (r.text or "").lower()
+        r = s.get(url, timeout=1.5, allow_redirects=True, stream=True)
+        chunk = r.raw.read(4096, decode_content=True) if hasattr(r, "raw") else (r.text or "")[:4096]
+        text = chunk.decode(errors="ignore") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        tl = text.lower()
         for dm in _DEATH_MARKERS:
-            if dm.lower() in text:
+            if dm.lower() in tl:
                 return False
-        # CF画面の可能性は True 扱い
-        if any(k in text for k in _CLOUDFLARE_HINTS):
-            return True
-        # その他の 4xx/5xx は “死” と断定できないので True
         return True
     except Exception:
-        # タイムアウト等は “死” 断定不可 → True
+        # タイムアウト・ネットワークエラー等は “不明”→ True
         return True
 
-# -------- メイン収集（3本見つけたら即返す） --------
+# -------- メイン収集（先頭60件だけクイック判定／want到達で即返す） --------
 def fetch_listing_pages(num_pages: int = 100, deadline_ts: Optional[float] = None) -> List[str]:
     urls = _collect_via_sitemap(num_pages=num_pages, deadline_ts=deadline_ts)
-    if urls:
-        return urls
-
+    if urls: return urls
     urls = _collect_via_wp_api(num_pages=num_pages, deadline_ts=deadline_ts)
-    if urls:
-        return urls
-
+    if urls: return urls
     return _collect_via_playwright(num_pages=num_pages, deadline_ts=deadline_ts)
 
 def collect_fresh_gofile_urls(
     already_seen: Set[str], want: int = 3, num_pages: int = 100, deadline_sec: Optional[int] = None
 ) -> List[str]:
-    # want はデフォルト 3（bot 側で 3 本投稿のため）
     deadline_ts = (_now() + deadline_sec) if deadline_sec else None
-    urls = fetch_listing_pages(num_pages=num_pages, deadline_ts=deadline_ts)
+    raw = fetch_listing_pages(num_pages=num_pages, deadline_ts=deadline_ts)
 
     uniq: List[str] = []
     seen_now: Set[str] = set()
-    for url in urls:
+
+    candidates = [u for u in raw if u not in already_seen][:60]
+
+    for url in candidates:
         if _deadline_passed(deadline_ts):
-            print("[info] deadline reached during filtering; stop.")
-            break
-        if url in already_seen or url in seen_now:
+            print("[info] deadline reached during filtering; stop."); break
+        if url in seen_now:
             continue
-        # 高速・寛容な死活判定
-        if not is_gofile_alive(url):
-            continue
-        uniq.append(url); seen_now.add(url)
-        if len(uniq) >= want:
-            break
+        if is_gofile_alive(url):
+            uniq.append(url); seen_now.add(url)
+            if len(uniq) >= want:
+                break
     return uniq
